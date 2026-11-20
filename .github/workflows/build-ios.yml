@@ -1,0 +1,318 @@
+# Builds an UNSIGNED iOS .ipa of this fork on a GitHub-hosted macOS runner.
+#
+# - Runner: macos-15-intel. The macos-14 label is rejected for this account and
+#   the arm64 (macos-26) pool is heavily constrained; Intel runners are available.
+# - No Apple developer account / certificate is used: the app is only ad-hoc
+#   signed with ldid (entitlements.sideload.xml), exactly like `make package`
+#   does without TEAMID/PROVISIONING.
+# - iOS Java runtimes are NOT downloaded from the flaky assets.angelauramc.dev
+#   host by default. When `upstream_token` is supplied (a PAT that can read
+#   public GitHub artifacts), the four JREs are extracted from an upstream
+#   Amethyst nightly IPA instead. A release asset (`jre_pack_release`) and the
+#   legacy asset host remain available as fallbacks.
+# - Optionally repackages the result as a TrollStore .tipa (no extra compile,
+#   only re-signs the copy with entitlements.trollstore.xml).
+name: Build Amethyst IPA (from private source)
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_trollstore:
+        description: "Also produce a TrollStore .tipa (re-sign + repackage, no rebuild)"
+        type: boolean
+        default: true
+      source_ref:
+        description: "Private source branch/tag to build (default: feature/mc26-native)"
+        type: string
+        default: "feature/mc26-native"
+      jre_pack_release:
+        description: "Release tag containing ios-jre-pack.zip (empty = skip)"
+        type: string
+        default: ""
+      jre25_url:
+        description: "Optional iOS arm64 JRE 25 archive (.tar.xz) to bundle when the upstream IPA lacks it"
+        type: string
+        default: "https://github.com/catsruledogs/JRE25/releases/download/JRE25/jre25-ios-arm64-20260509-release.tar.xz"
+      signing_cert_p12:
+        description: "Optional: base64 of an Apple signing certificate (.p12). When set, the IPA is codesigned with it."
+        type: string
+        default: ""
+      signing_cert_password:
+        description: "Optional: password of the .p12 certificate"
+        type: string
+        default: ""
+      signing_provisioning_profile:
+        description: "Optional: base64 of the .mobileprovision matching org.angelauramc.amethyst"
+        type: string
+        default: ""
+      signing_team_id:
+        description: "Optional: Apple Developer Team ID (used in the application-identifier entitlement)"
+        type: string
+        default: ""
+
+# Only manual runs: this avoids accidentally spending macOS minutes on every push.
+concurrency:
+  group: unsigned-ios-build
+  cancel-in-progress: true
+
+jobs:
+  build-ios:
+    runs-on: macos-15-intel
+    timeout-minutes: 170
+
+    defaults:
+      run:
+        working-directory: src
+
+    steps:
+      - name: Clone private source
+        working-directory: ${{ github.workspace }}
+        env:
+          SOURCE_TOKEN: ${{ secrets.SOURCE_TOKEN }}
+        run: |
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE"
+          git config --global url."https://github.com/".insteadOf "git@github.com:"
+          git clone --depth 1 --branch "${{ inputs.source_ref }}" \
+            --recurse-submodules --shallow-submodules \
+            "https://x-access-token:${SOURCE_TOKEN}@github.com/yangguangkailangdananha/Amethyst-iOS.git" src
+          cd src && git log --oneline -1
+
+      - name: Install build dependencies
+        run: |
+          set -euo pipefail
+          export HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_INSTALL_CLEANUP=1
+          brew install make cmake ldid >/dev/null 2>&1 || true
+
+          if ! command -v gmake >/dev/null 2>&1; then
+            echo "gmake is missing, retrying the Homebrew install"
+            brew install make || true
+            command -v gmake >/dev/null 2>&1 || { echo "ERROR: gmake missing" >&2; exit 1; }
+          fi
+
+          if ! command -v ldid >/dev/null 2>&1; then
+            echo "Homebrew ldid unavailable, using the Procursus static build"
+            case "$(uname -m)" in
+              arm64) LDID_ASSET=ldid_macosx_arm64 ;;
+              *)     LDID_ASSET=ldid_macosx_x86_64 ;;
+            esac
+            curl -fSL --retry 3 -o /tmp/ldid \
+              "https://github.com/ProcursusTeam/ldid/releases/latest/download/${LDID_ASSET}"
+            chmod +x /tmp/ldid
+            sudo mv /tmp/ldid /usr/local/bin/ldid
+            sudo chmod +x /usr/local/bin/ldid
+          fi
+
+          echo "gmake: $(gmake --version | head -1)"
+          echo "cmake: $(cmake --version | head -1)"
+          echo "ldid:  $(ldid -v 2>&1 | head -1 || true)"
+          echo "arch:  $(uname -m)"
+          xcodebuild -version | head -2
+          xcrun --sdk iphoneos --show-sdk-path
+
+      - name: Set up JDK 8 (boot JDK for the Java part)
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '8'
+
+      - name: Provide iOS Java runtimes
+        env:
+          GH_TOKEN: ${{ github.token }}
+          UPSTREAM_TOKEN: ${{ secrets.UPSTREAM_TOKEN }}
+          JRE_PACK_RELEASE: ${{ inputs.jre_pack_release }}
+          JRE25_URL: ${{ inputs.jre25_url }}
+          UPSTREAM_REPO: AngelAuraMC/Amethyst-iOS
+        run: |
+          set -euo pipefail
+          mkdir -p depends
+          missing=""
+          for v in 8 17 21 25; do
+            [ -f "depends/java-${v}-openjdk/release" ] || missing="$missing $v"
+          done
+          echo "missing runtimes:${missing:- none}"
+
+          if [ -n "$missing" ]; then
+            if [ -n "${UPSTREAM_TOKEN:-}" ]; then
+              echo "::add-mask::${UPSTREAM_TOKEN}"
+              echo "Fetching the iOS Java runtimes from an upstream Amethyst nightly IPA"
+              mkdir -p /tmp/upstream
+              ARTIFACTS_JSON=$(curl -sS --retry 3 -H "Authorization: Bearer ${UPSTREAM_TOKEN}" \
+                -H "Accept: application/vnd.github+json" \
+                "https://api.github.com/repos/${UPSTREAM_REPO}/actions/artifacts?per_page=100")
+              ART_ID=$(printf '%s' "$ARTIFACTS_JSON" | jq -r \
+                '[.artifacts[] | select(.name == "org.angelauramc.amethyst-ios.ipa" and .expired == false)][0].id // empty')
+              if [ -z "$ART_ID" ]; then
+                echo "ERROR: upstream IPA artifact not found" >&2
+                exit 1
+              fi
+              echo "upstream artifact id: ${ART_ID}"
+              curl -fSL --retry 3 -H "Authorization: Bearer ${UPSTREAM_TOKEN}" \
+                -H "Accept: application/vnd.github+json" \
+                -o /tmp/upstream/artifact.zip \
+                "https://api.github.com/repos/${UPSTREAM_REPO}/actions/artifacts/${ART_ID}/zip"
+              unzip -q -o /tmp/upstream/artifact.zip -d /tmp/upstream/artifact
+              IPA=$(find /tmp/upstream/artifact -name '*.ipa' | head -1)
+              test -n "$IPA"
+              echo "extracting $IPA"
+              unzip -q -o "$IPA" -d /tmp/upstream/ipa
+              RUNTIMES=$(find /tmp/upstream/ipa -maxdepth 4 -type d -name java_runtimes | head -1)
+              test -n "$RUNTIMES"
+              echo "upstream runtimes:"; ls -1 "$RUNTIMES" || true
+              cp -R "$RUNTIMES"/. depends/
+            elif [ -n "${JRE_PACK_RELEASE:-}" ]; then
+              echo "Downloading JRE pack from release ${JRE_PACK_RELEASE}"
+              mkdir -p /tmp/jre-pack
+              gh release download "${JRE_PACK_RELEASE}" \
+                --pattern 'ios-jre-pack.zip' --dir /tmp/jre-pack \
+                --repo "${GITHUB_REPOSITORY}" --clobber
+              echo "Downloaded $(du -h /tmp/jre-pack/ios-jre-pack.zip | cut -f1)"
+              unzip -q -o /tmp/jre-pack/ios-jre-pack.zip -d /tmp/jre-pack/out
+              for v in 8 17 21 25; do
+                src=$(find /tmp/jre-pack/out -maxdepth 2 -type d -name "java-${v}-openjdk" | head -1)
+                if [ -n "$src" ]; then
+                  rm -rf "depends/java-${v}-openjdk"
+                  cp -R "$src" "depends/java-${v}-openjdk"
+                  echo "installed java-${v}-openjdk from pack"
+                fi
+              done
+            else
+              for v in $missing; do
+                url="https://assets.angelauramc.dev/openjdk/ios-arm64/jre${v}-ios-aarch64.zip"
+                echo "Downloading ${url}"
+                curl -fSL --retry 3 --connect-timeout 20 -o "/tmp/jre${v}.zip" "$url"
+                mkdir -p "/tmp/jre${v}"
+                unzip -q -o "/tmp/jre${v}.zip" -d "/tmp/jre${v}"
+                tar -xJf "/tmp/jre${v}/jre${v}-"*.tar.xz -C "/tmp/jre${v}"
+                rm -rf "depends/java-${v}-openjdk"
+                cp -R "/tmp/jre${v}/jre${v}-openjdk" "depends/java-${v}-openjdk"
+              done
+            fi
+          fi
+
+          # Java 25 ships with Minecraft 26.3, but the upstream nightly IPA still
+          # only carries 8/17/21. Fetch a community-built iOS arm64 JRE 25.
+          if [ ! -f "depends/java-25-openjdk/release" ] && [ -n "${JRE25_URL:-}" ]; then
+            echo "Java 25 fallback: ${JRE25_URL}"
+            curl -fSL --retry 5 --retry-delay 3 -m 900 -o /tmp/jre25.tar.xz "${JRE25_URL}"
+            rm -rf depends/java-25-openjdk
+            mkdir -p depends/java-25-openjdk
+            tar -xJf /tmp/jre25.tar.xz -C depends/java-25-openjdk
+            test -f depends/java-25-openjdk/release
+            echo "Java 25 runtime installed"
+          fi
+
+          echo "--- runtimes available in depends ---"
+          ls -1 depends || true
+          for v in 8 17 21; do
+            if [ ! -f "depends/java-${v}-openjdk/release" ]; then
+              echo "ERROR: Java ${v} runtime is missing" >&2
+              exit 1
+            fi
+          done
+          if [ ! -f "depends/java-25-openjdk/release" ]; then
+            echo "::warning::Java 25 runtime is unavailable; packaging the remaining runtimes"
+          fi
+          du -sh depends/java-*-openjdk || true
+
+      - name: Import signing identity (optional)
+        if: ${{ inputs.signing_cert_p12 != '' && inputs.signing_team_id != '' }}
+        env:
+          CERT_P12: ${{ inputs.signing_cert_p12 }}
+          CERT_PASSWORD: ${{ inputs.signing_cert_password }}
+          PROFILE_B64: ${{ inputs.signing_provisioning_profile }}
+          TEAM_ID: ${{ inputs.signing_team_id }}
+        run: |
+          set -euo pipefail
+          echo "::add-mask::${CERT_P12}"
+          echo "::add-mask::${CERT_PASSWORD}"
+          echo "::add-mask::${PROFILE_B64}"
+          CERT_PATH="${RUNNER_TEMP}/signing.p12"
+          PROFILE_PATH="${RUNNER_TEMP}/profile.mobileprovision"
+          printf '%s' "$CERT_P12" | base64 --decode > "$CERT_PATH"
+          if [ -n "$PROFILE_B64" ]; then
+            printf '%s' "$PROFILE_B64" | base64 --decode > "$PROFILE_PATH"
+            mkdir -p "$HOME/Library/MobileDevice/Provisioning Profiles"
+            cp "$PROFILE_PATH" "$HOME/Library/MobileDevice/Provisioning Profiles/"
+          else
+            echo "WARNING: no provisioning profile supplied; codesign will use -" >&2
+          fi
+          KEYCHAIN="${RUNNER_TEMP}/build.keychain-db"
+          KEYCHAIN_PASSWORD="$(uuidgen)"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security import "$CERT_PATH" -P "$CERT_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN"
+          security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | tr -d '"')
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          IDENTITY=$(security find-identity -v -p codesigning "$KEYCHAIN" | sed -n 's/.*"\(.*\)"/\1/p' | head -1)
+          if [ -z "$IDENTITY" ]; then
+            echo "ERROR: no codesigning identity found in the imported certificate" >&2
+            exit 1
+          fi
+          echo "signing identity: ${IDENTITY}"
+          echo "SIGN_IDENTITY=${IDENTITY}" >> "$GITHUB_ENV"
+          echo "SIGN_TEAM_ID=${TEAM_ID}" >> "$GITHUB_ENV"
+          echo "SIGN_PROFILE=${PROFILE_PATH}" >> "$GITHUB_ENV"
+
+      - name: Build unsigned IPA
+        run: |
+          set -euo pipefail
+          export PATH="$(brew --prefix make)/libexec/gnubin:$(brew --prefix)/bin:$PATH"
+          export BOOTJDK="${JAVA_HOME}/bin"
+          echo "BOOTJDK=${BOOTJDK}"
+          "${BOOTJDK}/javac" -version
+          echo "build start: $(date -u +%H:%M:%S)"
+          if [ -n "${SIGN_IDENTITY:-}" ] && [ -n "${SIGN_TEAM_ID:-}" ]; then
+            echo "Building a certificate-signed IPA with identity: ${SIGN_IDENTITY}"
+            gmake -j"$(sysctl -n hw.ncpu)" package PLATFORM=2 BOOTJDK="${BOOTJDK}" JRE_NO_DOWNLOAD=1 \
+              TEAMID="${SIGN_TEAM_ID}" SIGNING_TEAMID="${SIGN_IDENTITY}" PROVISIONING="${SIGN_PROFILE}"
+          else
+            echo "No signing certificate supplied, producing the ad-hoc (ldid) unsigned IPA"
+            gmake -j"$(sysctl -n hw.ncpu)" package PLATFORM=2 BOOTJDK="${BOOTJDK}" JRE_NO_DOWNLOAD=1
+          fi
+          echo "build end: $(date -u +%H:%M:%S)"
+
+      - name: Collect IPA
+        run: |
+          set -euo pipefail
+          echo "--- artifacts ---"
+          ls -la artifacts
+          IPA=$(ls artifacts/*-ios.ipa | head -1)
+          test -n "$IPA"
+          if [ -n "${SIGN_IDENTITY:-}" ]; then
+            OUT=artifacts/Amethyst-signed-ios.ipa
+            echo "IPA codesigned with: ${SIGN_IDENTITY}"
+          else
+            OUT=artifacts/Amethyst-unsigned-ios.ipa
+            echo "No signing certificate supplied; IPA is ad-hoc (ldid) signed only"
+          fi
+          cp "$IPA" "$OUT"
+          echo "IPA: $OUT ($(du -h "$OUT" | cut -f1))"
+
+      - name: Package TrollStore .tipa (optional)
+        if: ${{ inputs.build_trollstore }}
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          rm -rf /tmp/trollstore
+          mkdir -p /tmp/trollstore
+          # The unsigned IPA is already zipped, so the payload folder can be moved
+          # instead of copied (saves ~1 GB of disk and time).
+          mv artifacts/Payload /tmp/trollstore/Payload
+          # ldid requires the entitlements path attached to -S (-Sfile.xml).
+          ldid -S"${PWD}/entitlements.trollstore.xml" \
+            /tmp/trollstore/Payload/AngelAuraAmethyst.app/AngelAuraAmethyst
+          (cd /tmp/trollstore && zip --symlinks -r \
+            "${GITHUB_WORKSPACE}/src/artifacts/Amethyst-trollstore.tipa" Payload)
+          echo "trollstore package: $(du -h artifacts/Amethyst-trollstore.tipa | cut -f1)"
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: amethyst-ios
+          path: |
+            src/artifacts/Amethyst-signed-ios.ipa
+            src/artifacts/Amethyst-unsigned-ios.ipa
+            src/artifacts/Amethyst-trollstore.tipa
+          if-no-files-found: error
