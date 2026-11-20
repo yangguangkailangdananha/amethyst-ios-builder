@@ -17,119 +17,17 @@ jobs:
           git clone --depth 1 --branch feature/mc26-native \
             "https://x-access-token:${SOURCE_TOKEN}@github.com/yangguangkailangdananha/Amethyst-iOS.git" src
 
-      - name: Download Temurin JDK 25 (macOS x64)
-        run: |
-          set -euo pipefail
-          curl -fSL --retry 3 -o "$RUNNER_TEMP/jdk25.tar.gz" \
-            "https://api.adoptium.net/v3/binary/latest/25/ga/mac/x64/jdk/hotspot/normal/eclipse"
-          mkdir -p "$RUNNER_TEMP/jdk25"
-          tar -xzf "$RUNNER_TEMP/jdk25.tar.gz" -C "$RUNNER_TEMP/jdk25" --strip-components=1
-          "$RUNNER_TEMP/jdk25/bin/java" -version
+      - name: Run Minecraft 26.3 simulation
+        run: bash src/tools/sim/run_simulation.sh "$GITHUB_WORKSPACE/src"
 
-      - name: Download Minecraft 26.3 client and libraries
-        run: |
-          set -euo pipefail
-          mkdir -p "$RUNNER_TEMP/mc" "$RUNNER_TEMP/natives"
-          python3 - <<'PY'
-import json, os, urllib.request
-base = os.environ["RUNNER_TEMP"]
-mc = os.path.join(base, "mc"); nat = os.path.join(base, "natives")
-man = json.load(urllib.request.urlopen("https://piston-meta.mojang.com/mc/game/version_manifest_v2.json"))
-ver = next(v for v in man["versions"] if v["id"] == "26.3")
-meta = json.load(urllib.request.urlopen(ver["url"]))
-open(os.path.join(base, "version.json"), "w").write(json.dumps(meta, indent=1))
-def dl(url, dest):
-    if not os.path.exists(dest):
-        urllib.request.urlretrieve(url, dest)
-dl(meta["downloads"]["client"]["url"], os.path.join(mc, "client.jar"))
-n = 0
-for lib in meta["libraries"]:
-    d = lib.get("downloads") or {}
-    art = d.get("artifact")
-    if art:
-        dl(art["url"], os.path.join(mc, os.path.basename(art["path"])))
-        n += 1
-    for k, cl in (d.get("classifiers") or {}).items():
-        if "macos" in k or "osx" in k or "natives-macos" in k:
-            dl(cl["url"], os.path.join(nat, os.path.basename(cl["path"])))
-print("jars:", n, "natives:", len(os.listdir(nat)))
-PY
-
-      - name: Build simulation harness
-        run: |
-          set -euo pipefail
-          mkdir -p "$RUNNER_TEMP/harness"
-          cat > "$RUNNER_TEMP/harness/Sim.java" <<'EOF'
-public class Sim {
-    public static void main(String[] args) throws Exception {
-        Thread.setDefaultUncaughtExceptionHandler((t, e) -> {
-            System.out.println("[SIM] uncaught in " + t.getName() + ": " + e);
-            e.printStackTrace(System.out);
-        });
-        try {
-            net.minecraft.client.main.Main.main(args);
-        } catch (Throwable t) {
-            System.out.println("[SIM] Main threw: " + t);
-            t.printStackTrace(System.out);
-            System.exit(2);
-        }
-    }
-}
-EOF
-          CP="src/JavaApp/libs343/*:$RUNNER_TEMP/mc/*"
-          "$RUNNER_TEMP/jdk25/bin/javac" -cp "$CP" -d "$RUNNER_TEMP/harness" "$RUNNER_TEMP/harness/Sim.java"
-
-      - name: Run simulation
-        run: |
-          set -euo pipefail
-          mkdir -p "$RUNNER_TEMP/game"
-          CP="src/JavaApp/libs343/*:$RUNNER_TEMP/mc/*:$RUNNER_TEMP/harness"
-          set +e
-          SDL_VIDEODRIVER=dummy timeout 180 "$RUNNER_TEMP/jdk25/bin/java" \
-            -Dorg.lwjgl.librarypath="$RUNNER_TEMP/natives" \
-            -Dorg.lwjgl.util.Debug=true \
-            -Djava.awt.headless=true \
-            -cp "$CP" Sim \
-            --version 26.3 --versionType release \
-            --gameDir "$RUNNER_TEMP/game" \
-            --assetsDir "$RUNNER_TEMP/game/assets" \
-            --assetIndex 26 \
-            --username Dev --uuid 00000000000000000000000000000000 \
-            --accessToken 0 --userType legacy > "$RUNNER_TEMP/sim.log" 2>&1
-          echo "exit=$?" >> "$RUNNER_TEMP/sim.log"
-          tail -120 "$RUNNER_TEMP/sim.log"
-
-      - name: Probe dlsym(RTLD_DEFAULT) from a dlopen'ed dylib
-        run: |
-          set -euo pipefail
-          cd "$RUNNER_TEMP"
-          cat > probe.c <<'EOF'
-#include <dlfcn.h>
-#include <stdio.h>
-void probe(void) { printf("probe Amethyst_GetHost=%p\n", dlsym(RTLD_DEFAULT, "Amethyst_GetHost")); fflush(stdout); }
-EOF
-          cat > hostapp.c <<'EOF'
-#include <dlfcn.h>
-#include <stdio.h>
-__attribute__((visibility("default"))) void Amethyst_GetHost(void) {}
-int main(void) {
-    void *h = dlopen("./libprobe.dylib", RTLD_NOW);
-    if (!h) { printf("dlopen failed: %s\n", dlerror()); return 1; }
-    void (*fn)(void) = (void (*)(void))dlsym(h, "probe");
-    fn();
-    return 0;
-}
-EOF
-          clang -dynamiclib -o libprobe.dylib probe.c
-          clang -o hostapp hostapp.c -Wl,-export_dynamic
-          ./hostapp > probe.log 2>&1 || true
-          cat probe.log
+      - name: Probe dlsym(RTLD_DEFAULT) from dlopen'ed dylib
+        run: bash src/tools/sim/probe_symbols.sh
 
       - name: Upload simulation logs
         uses: actions/upload-artifact@v4
         with:
           name: mc26-simulation
           path: |
-            ${{ runner.temp }}/sim.log
-            ${{ runner.temp }}/probe.log
+            ${{ runner.temp }}/mc26-sim/sim.log
+            ${{ runner.temp }}/mc26-sim/probe.log
           if-no-files-found: warn
