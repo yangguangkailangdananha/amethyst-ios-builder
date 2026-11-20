@@ -1,0 +1,92 @@
+name: Build SDL3 for iOS (private source)
+
+on:
+  workflow_dispatch:
+    inputs:
+      sdl_ref:
+        description: "SDL3 git ref (tag/branch) to build"
+        type: string
+        default: "release-3.4.20"
+      deployment_target:
+        description: "iOS deployment target"
+        type: string
+        default: "14.0"
+      source_ref:
+        description: "Private source branch/tag containing the Amethyst SDL driver"
+        type: string
+        default: "feature/mc26-native"
+
+jobs:
+  build-sdl3:
+    runs-on: macos-15-intel
+    timeout-minutes: 60
+    defaults:
+      run:
+        working-directory: src
+
+    steps:
+      - name: Clone private source
+        working-directory: ${{ github.workspace }}
+        env:
+          SOURCE_TOKEN: ${{ secrets.SOURCE_TOKEN }}
+        run: |
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE"
+          git clone --depth 1 --branch "${{ inputs.source_ref }}" \
+            "https://x-access-token:${SOURCE_TOKEN}@github.com/yangguangkailangdananha/Amethyst-iOS.git" src
+
+      - name: Download SDL3 source
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/sdl"
+          curl -fSL --retry 3 -o "$RUNNER_TEMP/sdl.tar.gz" \
+            "https://github.com/libsdl-org/SDL/archive/refs/tags/${{ inputs.sdl_ref }}.tar.gz"
+          tar -xzf "$RUNNER_TEMP/sdl.tar.gz" -C "$RUNNER_TEMP/sdl" --strip-components=1
+          ls "$RUNNER_TEMP/sdl" | head
+
+      - name: Apply Amethyst video driver patch
+        run: |
+          set -euo pipefail
+          python3 Natives/mc26/patch_sdl.py "$RUNNER_TEMP/sdl" Natives/mc26/sdl-driver
+          grep -n 'AMETHYST_bootstrap' "$RUNNER_TEMP/sdl/src/video/SDL_video.c" | head
+
+      - name: Configure SDL3 for iOS arm64
+        run: |
+          set -euo pipefail
+          cmake -S "$RUNNER_TEMP/sdl" -B "$RUNNER_TEMP/build-sdl3" \
+            -G "Unix Makefiles" \
+            -DCMAKE_SYSTEM_NAME=iOS \
+            -DCMAKE_OSX_ARCHITECTURES=arm64 \
+            -DCMAKE_OSX_SYSROOT=iphoneos \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET="${{ inputs.deployment_target }}" \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DSDL_SHARED=ON \
+            -DSDL_STATIC=OFF \
+            -DSDL_TESTS=OFF \
+            -DSDL_EXAMPLES=OFF \
+            -DSDL_INSTALL=OFF \
+            -DSDL_DISABLE_INSTALL=ON \
+            -DSDL_AMETHYST=ON
+
+      - name: Build SDL3
+        run: |
+          set -euo pipefail
+          cmake --build "$RUNNER_TEMP/build-sdl3" --config Release -j"$(sysctl -n hw.ncpu)"
+          lipo -info $(find "$RUNNER_TEMP/build-sdl3" -name "libSDL3.dylib" | head -1) 2>/dev/null || true
+          echo "--- Amethyst driver symbol ---"
+          nm -gU $(find "$RUNNER_TEMP/build-sdl3" -name "libSDL3.dylib" | head -1) 2>/dev/null | grep -i amethyst | head -10 || true
+
+      - name: Package artifacts
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/out"
+          find "$RUNNER_TEMP/build-sdl3" -name "libSDL3*.dylib" -exec cp {} "$RUNNER_TEMP/out/" \;
+          ( cd "$RUNNER_TEMP/out" && shasum -a 256 * > SHA256SUMS.txt || true )
+          ls -la "$RUNNER_TEMP/out"
+
+      - name: Upload SDL3 iOS artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: sdl3-ios
+          path: ${{ runner.temp }}/out/*
+          if-no-files-found: error
