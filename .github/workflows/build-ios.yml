@@ -255,6 +255,12 @@ jobs:
           echo "SIGN_TEAM_ID=${TEAM_ID}" >> "$GITHUB_ENV"
           echo "SIGN_PROFILE=${PROFILE_PATH}" >> "$GITHUB_ENV"
 
+      - name: Clean Java build
+        run: |
+          set -euo pipefail
+          rm -rf JavaApp/build
+          echo "JavaApp/build cleaned"
+
       - name: Inject build version
         run: |
           set -euo pipefail
