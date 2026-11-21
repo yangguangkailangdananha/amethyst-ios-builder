@@ -1,0 +1,37 @@
+name: Publish GitHub release
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: "Build run ID whose amethyst-ios artifact should be released"
+        required: true
+      version:
+        description: "Version tag without the leading v (e.g. 1.0.1234)"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download build artifact
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          gh run download "${{ inputs.run_id }}" -R "${{ github.repository }}" -n amethyst-ios -D out
+          ls -l out
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release create "v${{ inputs.version }}" out/*.ipa out/*.tipa \
+            --title "Amethyst iOS ${{ inputs.version }}" \
+            --notes "Automated build from run ${{ inputs.run_id }}." \
+            --latest
