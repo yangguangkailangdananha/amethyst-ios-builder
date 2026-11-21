@@ -59,10 +59,8 @@ jobs:
   build-ios:
     runs-on: macos-15-intel
     timeout-minutes: 170
-
-    defaults:
-      run:
-        working-directory: src
+    permissions:
+      contents: write
 
     steps:
       - name: Clone private source
@@ -331,3 +329,22 @@ jobs:
             src/artifacts/Amethyst-unsigned-ios.ipa
             src/artifacts/Amethyst-trollstore.tipa
           if-no-files-found: error
+
+      - name: Publish GitHub release (in-app update feed)
+        if: success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TAG="v1.0.${GITHUB_RUN_NUMBER}"
+          ASSETS="artifacts/Amethyst-trollstore.tipa artifacts/Amethyst-unsigned-ios.ipa"
+          if gh release view "$TAG" -R "${{ github.repository }}" >/dev/null 2>&1; then
+            gh release upload "$TAG" $ASSETS -R "${{ github.repository }}" --clobber
+          else
+            gh release create "$TAG" $ASSETS \
+              -R "${{ github.repository }}" \
+              --title "Amethyst iOS 1.0.${GITHUB_RUN_NUMBER}" \
+              --notes "Automated build ${GITHUB_RUN_NUMBER}." \
+              --latest
+          fi
+          echo "published $TAG"
