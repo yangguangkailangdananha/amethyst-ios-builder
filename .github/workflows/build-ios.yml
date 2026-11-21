@@ -255,6 +255,15 @@ jobs:
           echo "SIGN_TEAM_ID=${TEAM_ID}" >> "$GITHUB_ENV"
           echo "SIGN_PROFILE=${PROFILE_PATH}" >> "$GITHUB_ENV"
 
+      - name: Inject build version
+        run: |
+          set -euo pipefail
+          VER="1.0.${GITHUB_RUN_NUMBER}"
+          /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString ${VER}" Natives/Info.plist
+          /usr/libexec/PlistBuddy -c "Set :CFBundleVersion ${VER}" Natives/Info.plist
+          echo "app version: ${VER}"
+          /usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" Natives/Info.plist
+
       - name: Build unsigned IPA
         run: |
           set -euo pipefail
