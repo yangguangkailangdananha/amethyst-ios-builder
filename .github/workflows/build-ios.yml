@@ -62,6 +62,10 @@ jobs:
     permissions:
       contents: write
 
+    defaults:
+      run:
+        working-directory: src
+
     steps:
       - name: Clone private source
         working-directory: ${{ github.workspace }}
